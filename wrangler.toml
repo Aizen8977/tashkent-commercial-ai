@@ -1,11 +1,4 @@
+
 name = "tashkent-commercial-ai"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
-
-[[queues.producers]]
-binding = "MY_QUEUE"
-queue = "tashkent-commercial-ai-jobs"
-
-[[queues.consumers]]
-queue = "tashkent-commercial-ai-jobs"
-max_batch_size = 10
