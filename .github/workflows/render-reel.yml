@@ -8,8 +8,8 @@ on:
         description: "Telegram chat ID"
         required: true
         type: string
-      image_urls:
-        description: "HTTPS image URLs, one per line"
+      file_ids:
+        description: "Telegram file IDs, one per line"
         required: true
         type: string
 
@@ -22,42 +22,78 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg jq
 
-      - name: Download images
+      - name: Download Telegram media
         env:
-          IMAGE_URLS: ${{ inputs.image_urls }}
+          TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          FILE_IDS: ${{ inputs.file_ids }}
         run: |
+          set -euo pipefail
           mkdir -p media
           i=0
-          while IFS= read -r url; do
-            [ -z "$url" ] && continue
-            case "$url" in
-              https://*) ;;
-              *) echo "Only HTTPS URLs allowed"; exit 1 ;;
-            esac
-            i=$((i+1))
-            curl -fL "$url" -o "media/$i.jpg"
-          done <<< "$IMAGE_URLS"
-          if [ "$i" -eq 0 ]; then
-            echo "No images downloaded"
-            exit 1
-          fi
 
-      - name: Render video
+          while IFS= read -r file_id; do
+            [ -z "$file_id" ] && continue
+            i=$((i+1))
+
+            response=$(curl -fsS \
+              "https://api.telegram.org/bot${TOKEN}/getFile?file_id=${file_id}")
+
+            file_path=$(echo "$response" | jq -r '.result.file_path // empty')
+
+            if [ -z "$file_path" ]; then
+              echo "Telegram did not return a file path"
+              exit 1
+            fi
+
+            extension="${file_path##*.}"
+            curl -fsSL \
+              "https://api.telegram.org/file/bot${TOKEN}/${file_path}" \
+              -o "media/${i}.${extension}"
+
+          done <<< "$FILE_IDS"
+
+          test "$(find media -type f | wc -l)" -gt 0
+
+      - name: Render vertical video
         run: |
+          set -euo pipefail
           mkdir -p clips
-          for f in media/*.jpg; do
-            name=$(basename "$f" .jpg)
-            ffmpeg -y -loop 1 -i "$f" -t 5 \
-              -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
-              -r 30 -an "clips/$name.mp4"
+          i=0
+
+          for f in media/*; do
+            i=$((i+1))
+            ext="${f##*.}"
+
+            case "$ext" in
+              jpg|jpeg|png|webp)
+                ffmpeg -y -loop 1 -i "$f" -t 5 \
+                  -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+                  -r 30 -an "clips/${i}.mp4"
+                ;;
+              mp4|mov)
+                ffmpeg -y -i "$f" \
+                  -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+                  -af "aresample=44100" \
+                  -c:v libx264 -preset ultrafast \
+                  -c:a aac -r 30 -shortest \
+                  "clips/${i}.mp4"
+                ;;
+              *)
+                echo "Unsupported media format: $ext"
+                exit 1
+                ;;
+            esac
           done
+
           for f in clips/*.mp4; do
             echo "file '$f'" >> concat.txt
           done
+
           ffmpeg -y -f concat -safe 0 -i concat.txt \
-            -c:v libx264 -pix_fmt yuv420p -r 30 \
+            -c:v libx264 -c:a aac \
+            -pix_fmt yuv420p -r 30 \
             -movflags +faststart reel.mp4
 
       - name: Send video to Telegram
@@ -65,8 +101,7 @@ jobs:
           TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
         run: |
-          test -n "$TOKEN" || (echo "Missing TELEGRAM_TOKEN secret" && exit 1)
-          curl -f -X POST \
+          curl -fsS -X POST \
             -F "chat_id=$CHAT_ID" \
             -F "video=@reel.mp4" \
-            "https://api.telegram.org/bot$TOKEN/sendVideo"
+            "https://api.telegram.org/bot${TOKEN}/sendVideo"
