@@ -1,0 +1,72 @@
+
+name: Render property reel
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram chat ID"
+        required: true
+        type: string
+      image_urls:
+        description: "HTTPS image URLs, one per line"
+        required: true
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download images
+        env:
+          IMAGE_URLS: ${{ inputs.image_urls }}
+        run: |
+          mkdir -p media
+          i=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            case "$url" in
+              https://*) ;;
+              *) echo "Only HTTPS URLs allowed"; exit 1 ;;
+            esac
+            i=$((i+1))
+            curl -fL "$url" -o "media/$i.jpg"
+          done <<< "$IMAGE_URLS"
+          if [ "$i" -eq 0 ]; then
+            echo "No images downloaded"
+            exit 1
+          fi
+
+      - name: Render video
+        run: |
+          mkdir -p clips
+          for f in media/*.jpg; do
+            name=$(basename "$f" .jpg)
+            ffmpeg -y -loop 1 -i "$f" -t 5 \
+              -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+              -r 30 -an "clips/$name.mp4"
+          done
+          for f in clips/*.mp4; do
+            echo "file '$f'" >> concat.txt
+          done
+          ffmpeg -y -f concat -safe 0 -i concat.txt \
+            -c:v libx264 -pix_fmt yuv420p -r 30 \
+            -movflags +faststart reel.mp4
+
+      - name: Send video to Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          test -n "$TOKEN" || (echo "Missing TELEGRAM_TOKEN secret" && exit 1)
+          curl -f -X POST \
+            -F "chat_id=$CHAT_ID" \
+            -F "video=@reel.mp4" \
+            "https://api.telegram.org/bot$TOKEN/sendVideo"
