@@ -24,6 +24,7 @@ export default {
     }
 
     ctx.waitUntil(handleMessage(message, env));
+
     return new Response("OK");
   }
 };
@@ -33,11 +34,15 @@ async function handleMessage(message, env) {
   const text = message.text || message.caption || "";
 
   try {
+    if (!env.TELEGRAM_TOKEN || !env.GEMINI_API_KEY) {
+      throw new Error("Не настроены секреты Worker.");
+    }
+
     if (text.startsWith("/start")) {
       await sendTelegram(
         env.TELEGRAM_TOKEN,
         chatId,
-        "Привет! Я помощник по коммерческой недвижимости Ташкента.\n\nОтправь описание объекта текстом, и я его проанализирую."
+        "Привет! Я помощник по коммерческой недвижимости Ташкента.\n\nОтправь описание объекта, и я его проанализирую."
       );
       return;
     }
@@ -51,30 +56,31 @@ async function handleMessage(message, env) {
       return;
     }
 
-    if (!env.GEMINI_API_KEY || !env.TELEGRAM_TOKEN) {
-      throw new Error("Не настроены секреты Worker.");
-    }
-
     const prompt =
       "Ты эксперт по коммерческой недвижимости Ташкента. " +
-      "Проанализируй описание объекта. Выдели: тип недвижимости, район, адрес, площадь, этаж, высоту потолков, состояние, цену, цену за квадратный метр и контакты. " +
-      "Не выдумывай отсутствующие данные. Если информации нет, укажи «не указано». " +
-      "Оцени преимущества и недостатки объекта. " +
-      ""В конце подготовь грамотный текст объявления на русском языке. " +
-"Отвечай обычным текстом. Не используй Markdown, символы ###, **, * и другие маркеры форматирования. Используй простые заголовки и списки. " +.\n\n" +
+      "Подробно проанализируй описание объекта. " +
+      "Выдели тип недвижимости, район, адрес, площадь, этаж, высоту потолков, состояние, цену, цену за квадратный метр и контакты. " +
+      "Не выдумывай отсутствующие данные. Если информации нет, напиши «не указано». " +
+      "Рассчитай цену за квадратный метр, если известны площадь и месячная цена. " +
+      "Оцени преимущества, недостатки и потенциальные риски объекта. " +
+      "Подготовь отдельный грамотный текст объявления на русском языке. " +
+      "Отвечай обычным текстом. Не используй Markdown, символы решётки, звёздочки и другие маркеры форматирования. " +
+      "Используй понятные заголовки и списки. " +
+      "Не добавляй неподтверждённые сведения.\n\n" +
       "Описание объекта:\n" + text;
 
     const url =
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=" +
       encodeURIComponent(env.GEMINI_API_KEY);
 
-    let response;
-    let data;
+    let data = null;
+    let lastError = "Gemini временно недоступен.";
+
     const retryStatuses = [429, 500, 502, 503, 504];
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        response = await fetch(url, {
+        const response = await fetch(url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json"
@@ -100,25 +106,30 @@ async function handleMessage(message, env) {
           break;
         }
 
+        lastError =
+          data?.error?.message ||
+          "Ошибка Gemini API: " + response.status;
+
         if (!retryStatuses.includes(response.status)) {
-          console.error("Gemini API error:", response.status);
-          throw new Error("Gemini API error: " + response.status);
+          throw new Error(lastError);
         }
 
         if (attempt === 3) {
-          console.error("Gemini retries exhausted:", response.status);
-          throw new Error("Gemini временно недоступен: " + response.status);
+          throw new Error(lastError);
         }
+
       } catch (error) {
-        if (error.message.startsWith("Gemini API error:") ||
-            error.message.startsWith("Gemini временно недоступен:")) {
+        lastError = error.message || "Ошибка соединения с Gemini.";
+
+        if (
+          error.message &&
+          error.message.startsWith("Ошибка Gemini API:")
+        ) {
           throw error;
         }
 
-        console.error("Gemini network error, attempt:", attempt);
-
         if (attempt === 3) {
-          throw new Error("Не удалось подключиться к Gemini.");
+          throw new Error(lastError);
         }
       }
 
@@ -133,7 +144,7 @@ async function handleMessage(message, env) {
       .trim();
 
     if (!answer) {
-      throw new Error("Gemini не вернул текст.");
+      throw new Error("Gemini не вернул текстовый ответ.");
     }
 
     await sendTelegram(
@@ -149,12 +160,12 @@ async function handleMessage(message, env) {
       await sendTelegram(
         env.TELEGRAM_TOKEN,
         chatId,
-        "Не удалось обработать объявление. " +
+        "Не удалось обработать объявление.\nПричина: " +
         error.message +
-        "\nПопробуй отправить его ещё раз позже."
+        "\nПопробуй ещё раз позже."
       );
     } catch (telegramError) {
-      console.error("Telegram notification error:", telegramError.message);
+      console.error("Telegram error:", telegramError.message);
     }
   }
 }
@@ -179,6 +190,8 @@ async function sendTelegram(token, chatId, text) {
   const result = await response.json();
 
   if (!response.ok || !result.ok) {
-    throw new Error("Telegram send error: " + JSON.stringify(result));
+    throw new Error(
+      "Telegram send error: " + JSON.stringify(result)
+    );
   }
 }
