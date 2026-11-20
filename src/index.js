@@ -285,24 +285,121 @@ async function dispatchReelWorkflow(chatId, saved, githubToken) {
   }
 
   if (!response.ok) {
-    let responseData;
+    const responseText = await response.text().catch(() => "");
+    let responseData = null;
     try {
-      responseData = await response.json();
+      responseData = JSON.parse(responseText);
     } catch {
-      responseData = null;
+      // Some gateways return plain text or HTML instead of GitHub's JSON error format.
     }
-    const apiMessage = sanitizeApiMessage(responseData?.message, githubToken);
-    throw new Error("GitHub Actions: HTTP " + response.status +
-      (apiMessage ? ". Сообщение API: " + apiMessage : ". Проверь GITHUB_TOKEN и доступ к workflow.") +
-      " Материалы сохранены; после исправления повтори /render.");
+
+    const contentType = safeHeader(
+      "Content-Type", response.headers.get("Content-Type"), githubToken, 120, chatId
+    ) || "не указан";
+    const requestId = safeHeader(
+      "X-GitHub-Request-Id", response.headers.get("X-GitHub-Request-Id"), githubToken, 120, chatId
+    ) || "не указан";
+    const acceptedPermissions = safeHeader(
+      "X-Accepted-GitHub-Permissions",
+      response.headers.get("X-Accepted-GitHub-Permissions"),
+      githubToken,
+      200,
+      chatId
+    ) || "не указан";
+    const rawMessage = typeof responseData?.message === "string"
+      ? responseData.message
+      : isPlainTextContentType(contentType)
+        ? responseText
+        : "Ответ GitHub не содержит безопасного текстового сообщения.";
+    const safeMessage = sanitizeGitHubMessage(rawMessage, githubToken, chatId);
+
+    throw new Error(
+      "GitHub Actions: HTTP " + response.status +
+      "; Content-Type: " + contentType +
+      "; X-GitHub-Request-Id: " + requestId +
+      "; X-Accepted-GitHub-Permissions: " + acceptedPermissions +
+      "; Сообщение GitHub: " + (safeMessage || "не указано") +
+      ". Материалы сохранены; после исправления повтори /render."
+    );
   }
+}
+
+function safeHeader(name, value, githubToken, maxLength, chatId) {
+  if (!value) return "";
+  let safeValue = value
+    .replaceAll(githubToken, "[секрет скрыт]")
+    .replace(/https?:\/\/[^\s]+/gi, "[ссылка скрыта]")
+    .replace(/Aizen8977/gi, "[пользователь скрыт]")
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[контакт скрыт]")
+    .replace(/@[A-Za-z0-9_-]{1,39}/g, "[пользователь скрыт]")
+    .replace(/\b(?:user|account|login)\s*[:=]?\s*[A-Za-z0-9_-]{1,39}/gi,
+      match => match.replace(/[A-Za-z0-9_-]+$/, "[пользователь скрыт]"))
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+
+  safeValue = replaceDelimitedIdentifier(safeValue, String(chatId));
+
+  if (name === "Content-Type") {
+    const match = safeValue.match(/^([A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+)(?:\s*;\s*charset=([A-Za-z0-9._-]+))?$/i);
+    return match
+      ? match[1].toLowerCase() + (match[2] ? "; charset=" + match[2].toLowerCase() : "")
+      : "";
+  }
+
+  if (name === "X-Accepted-GitHub-Permissions") {
+    const allowedPermissions = new Set([
+      "actions", "attestations", "checks", "contents", "deployments", "discussions",
+      "id-token", "id_token", "issues", "metadata", "packages", "pages",
+      "pull-requests", "pull_requests", "repository-projects", "repository_projects",
+      "security-events", "security_events", "statuses", "workflows"
+    ]);
+    const permissions = safeValue.split(/[;,]/).map(value => value.trim());
+    const valid = permissions.length > 0 && permissions.every(permission => {
+      const match = permission.match(/^([a-z-]+)=(none|read|write)$/i);
+      return match && allowedPermissions.has(match[1].toLowerCase());
+    });
+    return valid ? permissions.join("; ") : "";
+  }
+
+  // Preserve GitHub's correlation ID, while removing secrets, URLs and the caller's exact chat ID.
+  return /^[A-Za-z0-9._:-]+$/.test(safeValue) ? safeValue : "";
+}
+
+function replaceDelimitedIdentifier(value, identifier) {
+  if (!identifier) return value;
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp("(^|[^A-Za-z0-9])" + escaped + "(?=$|[^A-Za-z0-9])", "g");
+  return value.replace(pattern, "$1[идентификатор скрыт]");
+}
+
+function isPlainTextContentType(contentType) {
+  return /^text\/plain(?:\s*;|$)/i.test(contentType);
+}
+
+function sanitizeGitHubMessage(message, githubToken, chatId) {
+  if (typeof message !== "string" || !message.trim()) return "";
+  const safeChatId = String(chatId);
+  return message
+    .replaceAll(githubToken, "[секрет скрыт]")
+    .replace(/Aizen8977/gi, "[пользователь скрыт]")
+    .replaceAll(safeChatId, "[идентификатор скрыт]")
+    .replace(/https?:\/\/[^\s]+/gi, "[ссылка скрыта]")
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[контакт скрыт]")
+    .replace(/@[A-Za-z0-9_-]{1,39}/g, "[пользователь скрыт]")
+    .replace(/\b(?:user|account|login)\s*[:=]?\s*[A-Za-z0-9_-]{1,39}/gi,
+      match => match.replace(/[A-Za-z0-9_-]+$/, "[пользователь скрыт]"))
+    .replace(/\b\d{5,}\b/g, "[идентификатор скрыт]")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim()
+    .slice(0, 400);
 }
 
 function sanitizeApiMessage(message, apiKey) {
   if (typeof message !== "string" || !message.trim()) return "";
   return message
     .replaceAll(apiKey, "[скрытый ключ]")
-    .replace(/https?:\/\/[^\s]+/g, "[ссылка скрыта]")
+    .replace(/https?:\/\/[^\s]+/gi, "[ссылка скрыта]")
     .replace(/[\r\n\t]+/g, " ")
     .slice(0, 600);
 }
