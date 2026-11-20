@@ -5,10 +5,10 @@ import worker, { analyzeListing, handleMessage } from "../src/index.js";
 const originalFetch = globalThis.fetch;
 const originalConsoleError = console.error;
 
-function jsonResponse(payload, status = 200) {
+function jsonResponse(payload, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { "Content-Type": "application/json" }
+    headers: { "Content-Type": "application/json", ...extraHeaders }
   });
 }
 
@@ -211,7 +211,13 @@ test("/render keeps media and reports a GitHub HTTP error safely", async () => {
   const sentMessages = [];
   globalThis.fetch = async (url, options) => {
     if (String(url).includes("api.github.com")) {
-      return jsonResponse({ message: "Resource not accessible with token github-test-token" }, 403);
+      return jsonResponse({
+        message: "Resource not accessible for user alice, id 987654; chat 123; URL https://github.com/alice/repo; token github-test-token; repo Aizen8977"
+      }, 403, {
+        "Content-Type": "application/json; user=alice; chat=123",
+        "X-GitHub-Request-Id": "RQ-abc123",
+        "X-Accepted-GitHub-Permissions": "actions=write; contents=read"
+      });
     }
     sentMessages.push(JSON.parse(options.body).text);
     return jsonResponse({ ok: true, result: {} });
@@ -231,9 +237,50 @@ test("/render keeps media and reports a GitHub HTTP error safely", async () => {
 
   assert.equal(deleted, false);
   assert.match(sentMessages[0], /HTTP 403/);
+  assert.match(sentMessages[0], /Content-Type: не указан/);
+  assert.match(sentMessages[0], /X-GitHub-Request-Id: RQ-abc123/);
+  assert.match(sentMessages[0], /X-Accepted-GitHub-Permissions: actions=write; contents=read/);
   assert.match(sentMessages[0], /Resource not accessible/);
-  assert.doesNotMatch(sentMessages[0], /github-test-token/);
+  assert.doesNotMatch(sentMessages[0], /github-test-token|https:\/\/|alice|987654|chat 123|Aizen8977/);
   assert.match(sentMessages[0], /Материалы сохранены/);
+});
+
+test("/render safely reports non-JSON GitHub error responses", async () => {
+  console.error = () => {};
+  const sentMessages = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("api.github.com")) {
+      return new Response(
+        "Gateway denied request for user bob id 456789 chat 123 at https://internal.example/path token github-test-token",
+        {
+          status: 502,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-GitHub-Request-Id": "RQ-text456",
+            "X-Accepted-GitHub-Permissions": "actions=write; user=bob; chat=123; github-test-token"
+          }
+        }
+      );
+    }
+    sentMessages.push(JSON.parse(options.body).text);
+    return jsonResponse({ ok: true, result: {} });
+  };
+
+  await handleMessage(
+    { chat: { id: 123 }, text: "/render" },
+    {
+      TELEGRAM_TOKEN: "telegram-test-token",
+      GITHUB_TOKEN: "github-test-token",
+      REELS_KV: { async get() { return ["file-one"]; }, async delete() {} }
+    }
+  );
+
+  assert.match(sentMessages[0], /HTTP 502/);
+  assert.match(sentMessages[0], /Content-Type: text\/plain; charset=utf-8/);
+  assert.match(sentMessages[0], /X-GitHub-Request-Id: RQ-text456/);
+  assert.match(sentMessages[0], /X-Accepted-GitHub-Permissions: не указан/);
+  assert.match(sentMessages[0], /Gateway denied request/);
+  assert.doesNotMatch(sentMessages[0], /github-test-token|https:\/\/|internal\.example|bob|456789|chat 123/);
 });
 
 test("/render keeps media and reports GitHub network errors", async () => {
